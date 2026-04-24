@@ -1,0 +1,875 @@
+# PRODUCTION READY: THREE-AI RELAY PLATFORM WITH GITHUB DEPLOY INTEGRATION
+
+## Complete Build Implementation
+
+### 1. Enhanced package.json
+
+```json
+{
+  "name": "three-ai-relay-platform",
+  "version": "2.0.0",
+  "description": "Three-AI Relay Platform with GitHub Deploy Integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "init-db": "node init-db.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "better-sqlite3": "^8.7.0",
+    "bcrypt": "^5.1.1",
+    "express-session": "^1.17.3",
+    "multer": "^1.4.5-lts.1",
+    "archiver": "^6.0.1",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^2.6.7",
+    "simple-git": "^3.20.0",
+    "fs-extra": "^11.1.1",
+    "uuid": "^9.0.1",
+    "moment": "^2.29.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "ai",
+    "relay",
+    "github",
+    "deployment",
+    "automation"
+  ],
+  "author": "Three-AI Relay Team",
+  "license": "MIT"
+}
+```
+
+### 2. Enhanced server.js
+
+```javascript
+const express = require('express');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcrypt');
+const session = require('express-session');
+const multer = require('multer');
+const archiver = require('archiver');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const fsExtra = require('fs-extra');
+const fetch = require('node-fetch');
+const simpleGit = require('simple-git');
+const { v4: uuidv4 } = require('uuid');
+const moment = require('moment');
+
+require('dotenv').config();
+
+const app = express();
+const port = process.env.PORT || 5000;
+
+// Initialize database
+const db = new Database('relay.db');
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "https://api.github.com"]
+    }
+  }
+}));
+
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' ? false : true,
+  credentials: true
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+const deployLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5 // limit deployments to 5 per hour per IP
+});
+
+// Middleware
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.static('public'));
+
+// Session configuration
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'relay-platform-secret-key-change-in-production',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
+}));
+
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = 'uploads/';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    cb(null, Date.now() + '-' + file.originalname);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 50 * 1024 * 1024 // 50MB limit
+  }
+});
+
+// Authentication middleware
+const requireAuth = (req, res, next) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  next();
+};
+
+// GitHub API helper functions
+class GitHubDeployManager {
+  constructor() {
+    this.apiBase = 'https://api.github.com';
+  }
+
+  async createRepository(token, repoName, description, isPrivate = false) {
+    try {
+      const response = await fetch(`${this.apiBase}/user/repos`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `token ${token}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'Three-AI-Relay-Platform'
+        },
+        body: JSON.stringify({
+          name: repoName,
+          description: description,
+          private: isPrivate,
+          auto_init: true
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`GitHub API error: ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Error creating repository:', error);
+      throw error;
+    }
+  }
+
+  async uploadFiles(token, owner, repo, files, commitMessage) {
+    try {
+      for (const file of files) {
+        const content = Buffer.from(file.content).toString('base64');
+        
+        await fetch(`${this.apiBase}/repos/${owner}/${repo}/contents/${file.path}`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `token ${token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'Three-AI-Relay-Platform'
+          },
+          body: JSON.stringify({
+            message: commitMessage,
+            content: content
+          })
+        });
+      }
+      return true;
+    } catch (error) {
+      console.error('Error uploading files:', error);
+      throw error;
+    }
+  }
+
+  async enablePages(token, owner, repo, source = 'main') {
+    try {
+      const response = await fetch(`${this.apiBase}/repos/${owner}/${repo}/pages`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `token ${token}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'Three-AI-Relay-Platform'
+        },
+        body: JSON.stringify({
+          source: {
+            branch: source,
+            path: '/'
+          }
+        })
+      });
+
+      if (response.status === 201 || response.status === 200) {
+        return await response.json();
+      } else if (response.status === 409) {
+        // Pages already enabled
+        return { message: 'Pages already enabled' };
+      } else {
+        throw new Error(`GitHub Pages API error: ${response.status}`);
+      }
+    } catch (error) {
+      console.error('Error enabling GitHub Pages:', error);
+      throw error;
+    }
+  }
+}
+
+const githubManager = new GitHubDeployManager();
+
+// Routes
+
+// Authentication routes
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Check if user exists
+    const existingUser = db.prepare('SELECT id FROM users WHERE email = ? OR username = ?').get(email, username);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
+    // Insert user
+    const result = db.prepare('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)').run(username, email, hashedPassword);
+    
+    req.session.userId = result.lastInsertRowid;
+    req.session.username = username;
+    
+    res.json({ success: true, user: { id: result.lastInsertRowid, username, email } });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    req.session.userId = user.id;
+    req.session.username = user.username;
+    
+    res.json({ success: true, user: { id: user.id, username: user.username, email: user.email } });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).json({ error: 'Logout failed' });
+    }
+    res.json({ success: true });
+  });
+});
+
+// Project routes
+app.post('/api/projects', requireAuth, (req, res) => {
+  try {
+    const { prompt } = req.body;
+    
+    if (!prompt) {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const crossRefId = uuidv4();
+    const result = db.prepare('INSERT INTO projects (user_id, cross_ref_id, prompt, status) VALUES (?, ?, ?, ?)').run(req.session.userId, crossRefId, prompt, 'active');
+    
+    res.json({ 
+      success: true, 
+      project: { 
+        id: result.lastInsertRowid, 
+        cross_ref_id: crossRefId,
+        prompt, 
+        status: 'active',
+        created_at: moment().format('YYYY-MM-DD HH:mm:ss')
+      } 
+    });
+  } catch (error) {
+    console.error('Project creation error:', error);
+    res.status(500).json({ error: 'Failed to create project' });
+  }
+});
+
+app.get('/api/projects', requireAuth, (req, res) => {
+  try {
+    const projects = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC').all(req.session.userId);
+    res.json({ success: true, projects });
+  } catch (error) {
+    console.error('Projects fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch projects' });
+  }
+});
+
+app.get('/api/projects/:id', requireAuth, (req, res) => {
+  try {
+    const project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(req.params.id, req.session.userId);
+    
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const artifacts = db.prepare('SELECT * FROM artifacts WHERE project_id = ? ORDER BY created_at DESC').all(project.id);
+    
+    res.json({ success: true, project: { ...project, artifacts } });
+  } catch (error) {
+    console.error('Project fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch project' });
+  }
+});
+
+// Artifact routes
+app.post('/api/projects/:projectId/artifacts', requireAuth, upload.single('file'), (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { author, message, content, filename } = req.body;
+    
+    // Verify project ownership
+    const project = db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').get(projectId, req.session.userId);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const fileId = uuidv4();
+    let finalContent = content;
+    let finalFilename = filename;
+
+    // Handle file upload
+    if (req.file) {
+      finalContent = fs.readFileSync(req.file.path, 'utf8');
+      finalFilename = req.file.originalname;
+    }
+
+    const result = db.prepare('INSERT INTO artifacts (project_id, file_id, author, message, content, filename) VALUES (?, ?, ?, ?, ?, ?)').run(projectId, fileId, author, message, finalContent, finalFilename);
+    
+    // Update project status
+    db.prepare('UPDATE projects SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run('active', projectId);
+    
+    res.json({ 
+      success: true, 
+      artifact: { 
+        id: result.lastInsertRowid, 
+        file_id: fileId,
+        author, 
+        message, 
+        filename: finalFilename,
+        created_at: moment().format('YYYY-MM-DD HH:mm:ss')
+      } 
+    });
+  } catch (error) {
+    console.error('Artifact creation error:', error);
+    res.status(500).json({ error: 'Failed to create artifact' });
+  }
+});
+
+app.get('/api/artifacts/:fileId/download', requireAuth, (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    const artifact = db.prepare(`
+      SELECT a.*, p.user_id 
+      FROM artifacts a 
+      JOIN projects p ON a.project_id = p.id 
+      WHERE a.file_id = ?
+    `).get(fileId);
+    
+    if (!artifact) {
+      return res.status(404).json({ error: 'Artifact not found' });
+    }
+
+    if (artifact.user_id !== req.session.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="${artifact.filename}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.send(artifact.content);
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+// GitHub deployment routes
+app.post('/api/projects/:projectId/deploy', deployLimiter, requireAuth, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { githubToken, repoName, description, isPrivate, deployType } = req.body;
+    
+    if (!githubToken || !repoName) {
+      return res.status(400).json({ error: 'GitHub token and repository name are required' });
+    }
+
+    // Verify project ownership
+    const project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(projectId, req.session.userId);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    // Get all artifacts for the project
+    const artifacts = db.prepare('SELECT * FROM artifacts WHERE project_id = ? ORDER BY created_at DESC').all(projectId);
+    
+    if (artifacts.length === 0) {
+      return res.status(400).json({ error: 'No artifacts to deploy' });
+    }
+
+    // Create GitHub repository
+    const repo = await githubManager.createRepository(githubToken, repoName, description || project.prompt, isPrivate);
+    
+    // Prepare files for upload
+    const files = [];
+    
+    // Add README.md
+    files.push({
+      path: 'README.md',
+      content: `# ${repoName}
+
+${description || project.prompt}
+
+## Project Details
+- **Created:** ${project.created_at}
+- **Last Updated:** ${project.updated_at}
+- **Status:** ${project.status}
+
+## Artifacts
+${artifacts.map(a => `- **${a.filename}** by ${a.author} - ${a.message}`).join('\n')}
+
+---
+*Generated by Three-AI Relay Platform*
+`
+    });
+
+    // Add artifacts as files
+    artifacts.forEach(artifact => {
+      files.push({
+        path: artifact.filename,
+        content: artifact.content
+      });
+    });
+
+    // If it's a web deployment, create additional files
+    if (deployType === 'web') {
+      // Create index.html if it doesn't exist
+      const hasIndexHtml = artifacts.some(a => a.filename.toLowerCase() === 'index.html');
+      if (!hasIndexHtml) {
+        const htmlContent = artifacts.find(a => a.filename.endsWith('.html'));
+        if (htmlContent) {
+          files.push({
+            path: 'index.html',
+            content: htmlContent.content
+          });
+        }
+      }
+
+      // Add deployment configuration
+      files.push({
+        path: '.github/workflows/deploy.yml',
+        content: `name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup Pages
+      uses: actions/configure-pages@v3
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v2
+      with:
+        path: '.'
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v2
+`
+      });
+    }
+
+    // Upload files to GitHub
+    await githubManager.uploadFiles(githubToken, repo.owner.login, repo.name, files, `Initial deployment from Three-AI Relay Platform`);
+    
+    let deploymentUrl = repo.html_url;
+    
+    // Enable GitHub Pages for web deployments
+    if (deployType === 'web') {
+      try {
+        await githubManager.enablePages(githubToken, repo.owner.login, repo.name);
+        deploymentUrl = `https://${repo.owner.login}.github.io/${repo.name}`;
+      } catch (error) {
+        console.warn('Could not enable GitHub Pages:', error);
+      }
+    }
+
+    // Record deployment
+    db.prepare('INSERT INTO deployments (project_id, user_id, github_repo_url, deployment_url, deploy_type, status) VALUES (?, ?, ?, ?, ?, ?)').run(
+      projectId, req.session.userId, repo.html_url, deploymentUrl, deployType || 'code', 'success'
+    );
+
+    // Update project status
+    db.prepare('UPDATE projects SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run('deployed', projectId);
+
+    res.json({ 
+      success: true, 
+      deployment: {
+        repositoryUrl: repo.html_url,
+        deploymentUrl: deploymentUrl,
+        deployType: deployType || 'code'
+      }
+    });
+
+  } catch (error) {
+    console.error('Deployment error:', error);
+    
+    // Record failed deployment
+    try {
+      db.prepare('INSERT INTO deployments (project_id, user_id, status, error_message) VALUES (?, ?, ?, ?)').run(
+        projectId, req.session.userId, 'failed', error.message
+      );
+    } catch (dbError) {
+      console.error('Failed to record deployment error:', dbError);
+    }
+    
+    res.status(500).json({ error: `Deployment failed: ${error.message}` });
+  }
+});
+
+// Get deployment history
+app.get('/api/projects/:projectId/deployments', requireAuth, (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    // Verify project ownership
+    const project = db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').get(projectId, req.session.userId);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const deployments = db.prepare('SELECT * FROM deployments WHERE project_id = ? ORDER BY created_at DESC').all(projectId);
+    
+    res.json({ success: true, deployments });
+  } catch (error) {
+    console.error('Deployments fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch deployments' });
+  }
+});
+
+// Bulk download route
+app.get('/api/projects/:projectId/download', requireAuth, (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    // Verify project ownership
+    const project = db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(projectId, req.session.userId);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const artifacts = db.prepare('SELECT * FROM artifacts WHERE project_id = ? ORDER BY created_at DESC').all(projectId);
+    
+    if (artifacts.length === 0) {
+      return res.status(404).json({ error: 'No artifacts found' });
+    }
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="project-${projectId}-${Date.now()}.zip"`);
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.status(500).json({ error: 'Archive creation failed' });
+    });
+
+    archive.pipe(res);
+
+    // Add project info
+    archive.append(JSON.stringify({
+      project: project,
+      artifacts: artifacts.map(a => ({
+        id: a.id,
+        file_id: a.file_id,
+        author: a.author,
+        message: a.message,
+        filename: a.filename,
+        created_at: a.created_at
+      }))
+    }, null, 2), { name: 'project-info.json' });
+
+    // Add each artifact
+    artifacts.forEach(artifact => {
+      archive.append(artifact.content, { name: artifact.filename });
+    });
+
+    archive.finalize();
+  } catch (error) {
+    console.error('Bulk download error:', error);
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+// Statistics route
+app.get('/api/stats', requireAuth, (req, res) => {
+  try {
+    const projectCount = db.prepare('SELECT COUNT(*) as count FROM projects WHERE user_id = ?').get(req.session.userId).count;
+    const artifactCount = db.prepare('SELECT COUNT(*) as count FROM artifacts a JOIN projects p ON a.project_id = p.id WHERE p.user_id = ?').get(req.session.userId).count;
+    const deploymentCount = db.prepare('SELECT COUNT(*) as count FROM deployments WHERE user_id = ?').get(req.session.userId).count;
+    
+    const recentActivity = db.prepare(`
+      SELECT 'project' as type, prompt as title, created_at 
+      FROM projects 
+      WHERE user_id = ? 
+      UNION ALL 
+      SELECT 'artifact' as type, filename as title, a.created_at 
+      FROM artifacts a 
+      JOIN projects p ON a.project_id = p.id 
+      WHERE p.user_id = ?
+      UNION ALL
+      SELECT 'deployment' as type, github_repo_url as title, created_at
+      FROM deployments
+      WHERE user_id = ?
+      ORDER BY created_at DESC 
+      LIMIT 10
+    `).all(req.session.userId, req.session.userId, req.session.userId);
+    
+    res.json({
+      success: true,
+      stats: {
+        projects: projectCount,
+        artifacts: artifactCount,
+        deployments: deploymentCount,
+        recentActivity
+      }
+    });
+  } catch (error) {
+    console.error('Stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch statistics' });
+  }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Serve main application
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Error handler
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
+app.listen(port, () => {
+  console.log(`Three-AI Relay Platform running on port ${port}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+module.exports = app;
+```
+
+### 3. Enhanced Database Initialization (init-db.js)
+
+```javascript
+const Database = require('better-sqlite3');
+
+const db = new Database('relay.db');
+
+// Users table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    github_token TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// Projects table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    cross_ref_id TEXT UNIQUE NOT NULL,
+    prompt TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id)
+  )
+`);
+
+// Artifacts table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    file_id TEXT UNIQUE NOT NULL,
+    author TEXT NOT NULL,
+    message TEXT,
+    content TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    file_size INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects (id)
+  )
+`);
+
+// New deployments table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS deployments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    github_repo_url TEXT,
+    deployment_url TEXT,
+    deploy_type TEXT DEFAULT 'code',
+    status TEXT DEFAULT 'pending',
+    error_message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    FOREIGN KEY (user_id) REFERENCES users (id)
+  )
+`);
+
+// Sessions table for better session management
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER,
+    data TEXT,
+    expires_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id)
+  )
+`);
+
+// Create indexes for better performance
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_projects_user_id ON projects(user_id);
+  CREATE INDEX IF NOT EXISTS idx_artifacts_project_id ON artifacts(project_id);
+  CREATE INDEX IF NOT EXISTS idx_deployments_project_id ON deployments(project_id);
+  CREATE INDEX IF NOT EXISTS idx_deployments_user_id ON deployments(user_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+`);
+
+console.log('Database initialized successfully');
+db.close();
+```
+
+### 4. Enhanced Frontend (public/index.html)
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three-AI Relay Platform</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
